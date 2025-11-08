@@ -7,9 +7,12 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Callable
 
-from faster_whisper import WhisperModel
+try:
+    from faster_whisper import WhisperModel
+except Exception:  # pragma: no cover - пакет может быть недоступен в окружении
+    WhisperModel = None  # type: ignore[assignment]
 
 try:
     from dotenv import load_dotenv
@@ -107,7 +110,6 @@ class TranscriptionJob:
 
     source_path: Path
     audio_path: Path
-    origin_tag: str
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
@@ -153,10 +155,42 @@ def _is_audio_up_to_date(source: Path, destination: Path) -> bool:
     return destination.exists() and destination.stat().st_mtime >= source.stat().st_mtime
 
 
+def media_requires_ffmpeg(config: PipelineConfig) -> bool:
+    """Возвращает True, если для текущих входных данных потребуется FFmpeg.
+
+    Проверяются видео и несжатые аудио форматы. Если включён skip_fresh_audio и
+    актуальный WAV уже существует, FFmpeg не требуется для конкретного файла.
+    """
+    # Видео
+    if config.video_in.exists() and config.video_in.is_dir():
+        for file in sorted(config.video_in.iterdir()):
+            if not file.is_file() or file.suffix.lower() not in config.video_formats:
+                continue
+            audio_path = config.audio_out / _build_audio_filename(file, "video")
+            if config.skip_fresh_audio and _is_audio_up_to_date(file, audio_path):
+                continue
+            return True
+
+    # Аудио, требующее перекодирования (не WAV)
+    if config.audio_in.exists() and config.audio_in.is_dir():
+        for file in sorted(config.audio_in.iterdir()):
+            if not file.is_file() or file.suffix.lower() not in config.audio_formats:
+                continue
+            if file.suffix.lower() == ".wav":
+                continue
+            audio_path = config.audio_out / _build_audio_filename(file, "audio")
+            if config.skip_fresh_audio and _is_audio_up_to_date(file, audio_path):
+                continue
+            return True
+
+    return False
+
+
 def _build_audio_filename(source: Path, origin_tag: str) -> str:
     """Формирует имя аудиофайла с учетом источника."""
     safe_tag = origin_tag.strip().replace(" ", "_").lower()
-    return f"{source.stem}_{safe_tag}.wav"
+    suffix = source.suffix.lower().lstrip(".") or "raw"
+    return f"{source.stem}_{safe_tag}_{suffix}.wav"
 
 
 def extract_audio(
@@ -233,59 +267,67 @@ def copy_wav(source: Path, destination: Path, logger: logging.Logger) -> bool:
     return True
 
 
+def _audio_prepare_handler(source: Path, destination: Path, logger: logging.Logger) -> bool:
+    """Выбирает стратегию подготовки аудио: копирование WAV или извлечение через FFmpeg."""
+    if source.suffix.lower() == ".wav":
+        return copy_wav(source, destination, logger)
+    return extract_audio(source, destination, logger)
+
+
+def _collect_jobs(
+    source_dir: Path,
+    formats: tuple[str, ...],
+    origin_tag: str,
+    handler: Callable[[Path, Path, logging.Logger], bool],
+    audio_out: Path,
+    skip_fresh: bool,
+    logger: logging.Logger,
+) -> list[TranscriptionJob]:
+    jobs: list[TranscriptionJob] = []
+    for file in sorted(source_dir.iterdir()):
+        if not file.is_file() or file.suffix.lower() not in formats:
+            continue
+        audio_path = audio_out / _build_audio_filename(file, origin_tag)
+        if skip_fresh and _is_audio_up_to_date(file, audio_path):
+            logger.info(
+                "Пропуск подготовки: %s (актуальный аудиофайл уже существует)", file.name
+            )
+            jobs.append(TranscriptionJob(source_path=file, audio_path=audio_path))
+            continue
+        if handler(file, audio_path, logger):
+            jobs.append(TranscriptionJob(source_path=file, audio_path=audio_path))
+    return jobs
+
+
 def prepare_jobs(config: PipelineConfig, logger: logging.Logger) -> list[TranscriptionJob]:
     """Собирает список задач на транскрибацию."""
     jobs: list[TranscriptionJob] = []
 
     if config.video_in.exists() and config.video_in.is_dir():
-        for file in sorted(config.video_in.iterdir()):
-            if not file.is_file() or file.suffix.lower() not in config.video_formats:
-                continue
-            audio_name = _build_audio_filename(file, "video")
-            audio_path = config.audio_out / audio_name
-            if config.skip_fresh_audio and _is_audio_up_to_date(file, audio_path):
-                logger.info(
-                    "Пропуск извлечения: %s (актуальный аудиофайл уже существует)", file.name
-                )
-                jobs.append(
-                    TranscriptionJob(source_path=file, audio_path=audio_path, origin_tag="video")
-                )
-                continue
-            if extract_audio(file, audio_path, logger):
-                jobs.append(
-                    TranscriptionJob(source_path=file, audio_path=audio_path, origin_tag="video")
-                )
+        jobs.extend(
+            _collect_jobs(
+                config.video_in,
+                config.video_formats,
+                "video",
+                extract_audio,
+                config.audio_out,
+                config.skip_fresh_audio,
+                logger,
+            )
+        )
 
     if config.audio_in.exists() and config.audio_in.is_dir():
-        for file in sorted(config.audio_in.iterdir()):
-            if not file.is_file() or file.suffix.lower() not in config.audio_formats:
-                continue
-            audio_name = _build_audio_filename(file, "audio")
-            audio_path = config.audio_out / audio_name
-
-            if config.skip_fresh_audio and _is_audio_up_to_date(file, audio_path):
-                logger.info(
-                    "Пропуск перекодирования: %s (актуальный WAV уже существует)", file.name
-                )
-                jobs.append(
-                    TranscriptionJob(source_path=file, audio_path=audio_path, origin_tag="audio")
-                )
-                continue
-
-            if file.suffix.lower() == ".wav":
-                if copy_wav(file, audio_path, logger):
-                    jobs.append(
-                        TranscriptionJob(
-                            source_path=file, audio_path=audio_path, origin_tag="audio"
-                        )
-                    )
-            else:
-                if extract_audio(file, audio_path, logger):
-                    jobs.append(
-                        TranscriptionJob(
-                            source_path=file, audio_path=audio_path, origin_tag="audio"
-                        )
-                    )
+        jobs.extend(
+            _collect_jobs(
+                config.audio_in,
+                config.audio_formats,
+                "audio",
+                _audio_prepare_handler,
+                config.audio_out,
+                config.skip_fresh_audio,
+                logger,
+            )
+        )
 
     return jobs
 
@@ -303,9 +345,9 @@ def detect_device_preference(logger: logging.Logger) -> tuple[str, str]:
             return False
 
     if preferred_device == "cuda":
-        if _cuda_available():
-            return "cuda", "float16"
-        logger.warning("Запрошен CUDA, но CUDA недоступен. Переходим на CPU.")
+        # При явном запросе CUDA пробуем загрузить модель на GPU.
+        # При ошибке загрузки произойдёт fallback в load_model().
+        return "cuda", "float16"
 
     elif preferred_device == "cpu":
         return "cpu", "int8"
@@ -320,6 +362,10 @@ def load_model(
     config: PipelineConfig, logger: logging.Logger
 ) -> WhisperModel:
     """Загружает модель Whisper с автоматическим переключением устройства."""
+    if WhisperModel is None:
+        raise RuntimeError(
+            "faster-whisper не установлен для текущего окружения. Установите пакет или используйте Python 3.11/3.12, где доступны колёса зависимостей."
+        )
     logger.info("Загрузка модели Whisper '%s'...", config.whisper_model)
     device, compute_type = detect_device_preference(logger)
 
@@ -329,6 +375,7 @@ def load_model(
             device=device,
             compute_type=compute_type,
             cpu_threads=config.cpu_threads,
+            num_workers=config.num_workers,
         )
         logger.info("Модель '%s' загружена на %s (compute_type=%s).", config.whisper_model, device, compute_type)
         return model
@@ -338,7 +385,13 @@ def load_model(
                 "Не удалось загрузить модель на CUDA (%s). Пробуем CPU (int8).",
                 error,
             )
-            return WhisperModel(config.whisper_model, device="cpu", compute_type="int8")
+            return WhisperModel(
+                config.whisper_model,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=config.cpu_threads,
+                num_workers=config.num_workers,
+            )
         raise
 
 
@@ -359,7 +412,6 @@ def transcribe_audio(
             beam_size=config.beam_size,
             vad_filter=config.vad_filter,
             vad_parameters={"min_silence_duration_ms": config.vad_min_silence_ms},
-            num_workers=config.num_workers,
         )
 
         with output_path.open("w", encoding="utf-8") as target:
@@ -379,7 +431,7 @@ def transcribe_audio(
         )
         return True
     except Exception as exc:
-        logger.error("Ошибка транскрибации %s: %s", job.audio_path.name, exc)
+        logger.exception("Ошибка транскрибации %s", job.audio_path.name)
         return False
 
 
@@ -387,11 +439,12 @@ def process_files(config: PipelineConfig, logger: logging.Logger) -> None:
     """Основной сценарий обработки пользовательских файлов."""
     logger.info("Запуск пайплайна Faster-Whisper Local")
     ensure_directories(config)
-    try:
-        ensure_ffmpeg_available(logger)
-    except RuntimeError as exc:
-        logger.error("Невозможно продолжить без FFmpeg: %s", exc)
-        return
+    if media_requires_ffmpeg(config):
+        try:
+            ensure_ffmpeg_available(logger)
+        except RuntimeError as exc:
+            logger.error("Нужен FFmpeg для видео/сжатых аудио: %s", exc)
+            return
 
     jobs = prepare_jobs(config, logger)
     if not jobs:
@@ -414,6 +467,10 @@ def process_files(config: PipelineConfig, logger: logging.Logger) -> None:
     for index, job in enumerate(jobs, start=1):
         logger.info("[%d/%d] Обработка %s", index, len(jobs), job.audio_path.name)
         result_path = config.transcripts_out / f"{job.audio_path.stem}.txt"
+        if result_path.exists() and result_path.stat().st_mtime >= job.audio_path.stat().st_mtime:
+            logger.info("Пропуск транскрибации (актуальный TXT уже есть): %s", result_path.name)
+            success += 1
+            continue
         if transcribe_audio(job, result_path, model, config, logger):
             success += 1
             logger.info("Результат сохранен: %s", result_path.name)
