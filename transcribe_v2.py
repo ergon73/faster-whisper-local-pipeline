@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -11,7 +12,10 @@ from typing import Optional, Sequence, Callable
 
 try:
     from faster_whisper import WhisperModel
-except Exception:  # pragma: no cover - пакет может быть недоступен в окружении
+except ImportError as exc:  # pragma: no cover - пакет может быть недоступен в окружении
+    logging.getLogger(__name__).warning(
+        "Не удалось импортировать faster_whisper: %s", exc
+    )
     WhisperModel = None  # type: ignore[assignment]
 
 try:
@@ -38,6 +42,12 @@ DEFAULT_AUDIO_FORMATS: tuple[str, ...] = (
     ".ogg",
     ".aac",
 )
+
+
+TARGET_SAMPLE_RATE = 16_000
+TARGET_CHANNELS = 1
+TARGET_BIT_DEPTH = 16
+TARGET_PCM_BIT_RATE = TARGET_SAMPLE_RATE * TARGET_CHANNELS * TARGET_BIT_DEPTH
 
 
 @dataclass(slots=True)
@@ -155,6 +165,63 @@ def _is_audio_up_to_date(source: Path, destination: Path) -> bool:
     return destination.exists() and destination.stat().st_mtime >= source.stat().st_mtime
 
 
+def _safe_int(value: object) -> Optional[int]:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _probe_audio_stream(source: Path, logger: logging.Logger) -> dict[str, int | str | None] | None:
+    """Возвращает метаданные первого аудиопотока средствами ffprobe."""
+    arguments = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name,channels,sample_rate,bit_rate",
+        "-of",
+        "json",
+        str(source),
+    ]
+
+    try:
+        result = subprocess.run(
+            arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        logger.debug("ffprobe не найден — пропускаем сбор метаданных для %s", source.name)
+        return None
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else str(exc)
+        logger.debug("ffprobe завершился с ошибкой для %s: %s", source.name, stderr)
+        return None
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        logger.debug("Не удалось разобрать вывод ffprobe для %s: %s", source.name, exc)
+        return None
+
+    streams = payload.get("streams")
+    if not streams:
+        return None
+
+    stream = streams[0]
+    return {
+        "codec_name": stream.get("codec_name"),
+        "channels": _safe_int(stream.get("channels")),
+        "sample_rate": _safe_int(stream.get("sample_rate")),
+        "bit_rate": _safe_int(stream.get("bit_rate")),
+    }
+
+
 def media_requires_ffmpeg(config: PipelineConfig) -> bool:
     """Возвращает True, если для текущих входных данных потребуется FFmpeg.
 
@@ -199,6 +266,42 @@ def extract_audio(
     logger: logging.Logger,
 ) -> bool:
     """Извлекает или перекодирует аудио трек в формат WAV."""
+    metadata = _probe_audio_stream(source, logger)
+    if metadata:
+        codec = metadata.get("codec_name") or "неизвестно"
+        channels = metadata.get("channels")
+        sample_rate = metadata.get("sample_rate")
+        bit_rate = metadata.get("bit_rate")
+        source_kbps = f"{bit_rate / 1000:.0f}" if bit_rate else "?"
+        logger.info(
+            "Исходное аудио: codec=%s, channels=%s, sample_rate=%s Гц, bitrate=%s kbps",
+            codec,
+            channels if channels is not None else "?",
+            sample_rate if sample_rate is not None else "?",
+            source_kbps,
+        )
+
+        if bit_rate and bit_rate > 0:
+            target_kbps = TARGET_PCM_BIT_RATE / 1000
+            if bit_rate <= TARGET_PCM_BIT_RATE:
+                logger.info(
+                    "Оценка потери качества при конвертации: ~0%% (битрейт %.0f → %.0f kbps).",
+                    bit_rate / 1000,
+                    target_kbps,
+                )
+            else:
+                loss_pct = (1 - TARGET_PCM_BIT_RATE / bit_rate) * 100
+                logger.info(
+                    "Оценка потери качества при конвертации: ~%.1f%% (битрейт %.0f → %.0f kbps).",
+                    loss_pct,
+                    bit_rate / 1000,
+                    target_kbps,
+                )
+        else:
+            logger.info(
+                "Оценка потери качества при конвертации: недостаточно данных о битрейте исходного аудио."
+            )
+
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -211,9 +314,9 @@ def extract_audio(
         "-acodec",
         "pcm_s16le",
         "-ar",
-        "16000",
+        str(TARGET_SAMPLE_RATE),
         "-ac",
-        "1",
+        str(TARGET_CHANNELS),
         "-y",
         str(destination),
     ]

@@ -152,3 +152,55 @@ def test_prepare_jobs_same_stem_different_ext(tmp_path: Path, monkeypatch: pytes
     filenames = sorted(job.audio_path.name for job in jobs)
     assert filenames == ["call_audio_m4a.wav", "call_audio_mp3.wav"]
 
+
+def test_media_requires_ffmpeg_detects_video(tmp_path: Path) -> None:
+    video_dir = tmp_path / "video_in"
+    audio_dir = tmp_path / "audio_in"
+    audio_out = tmp_path / "audio_out"
+    transcripts = tmp_path / "transcribe"
+
+    for directory in (video_dir, audio_dir, audio_out, transcripts):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    (video_dir / "clip.mp4").write_bytes(b"video")
+
+    config = pipeline.PipelineConfig(
+        video_in=video_dir,
+        audio_in=audio_dir,
+        audio_out=audio_out,
+        transcripts_out=transcripts,
+        skip_fresh_audio=True,
+        whisper_model="tiny",
+    )
+
+    assert pipeline.media_requires_ffmpeg(config) is True
+
+
+def test_media_requires_ffmpeg_skips_fresh_audio(tmp_path: Path) -> None:
+    video_dir = tmp_path / "video_in"
+    audio_dir = tmp_path / "audio_in"
+    audio_out = tmp_path / "audio_out"
+    transcripts = tmp_path / "transcribe"
+
+    for directory in (video_dir, audio_dir, audio_out, transcripts):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    source_audio = audio_dir / "speech.mp3"
+    source_audio.write_bytes(b"mp3")
+
+    destination_audio = audio_out / pipeline._build_audio_filename(source_audio, "audio")
+    destination_audio.write_bytes(b"wav")
+
+    src_stat = source_audio.stat()
+    os.utime(destination_audio, (src_stat.st_atime + 10, src_stat.st_mtime + 10))
+
+    config = pipeline.PipelineConfig(
+        video_in=video_dir,
+        audio_in=audio_dir,
+        audio_out=audio_out,
+        transcripts_out=transcripts,
+        skip_fresh_audio=True,
+        whisper_model="tiny",
+    )
+
+    assert pipeline.media_requires_ffmpeg(config) is False
