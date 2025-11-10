@@ -67,9 +67,15 @@ pytest
 python transcribe_v2.py
 ```
 
-### 3. Получите результаты
+### 3. (Опционально) Очистите транскрипты
+```bash
+python postprocess.py
+```
+
+### 4. Получите результаты
 - **Аудио** → папка `audio_out/`
 - **Транскрибация** → папка `transcribe/` (`.txt`, `.srt`, `.jsonl` для каждого файла)
+- **Пост-обработка** → папка `transcribe/` (`*_clean.md`, `*_packed.jsonl`, `*_postprocess_report.json`)
 
 ## Поддерживаемые форматы
 
