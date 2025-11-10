@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional, Sequence, Callable
 
@@ -170,6 +171,42 @@ def _safe_int(value: object) -> Optional[int]:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _fmt_srt_time(timestamp: float) -> str:
+    """Преобразует время в формате float секунд в строку SRT."""
+    milliseconds = int(round(timestamp * 1000))
+    delta = timedelta(milliseconds=milliseconds)
+    base = str(delta)
+    if "." in base:
+        base_part, frac = base.split(".")
+        return f"{base_part.zfill(8)},{frac[:3].ljust(3, '0')}"
+    return f"{base.zfill(8)},000"
+
+
+def _write_srt(segments: list[dict[str, object]], path: Path) -> None:
+    """Записывает сегменты в формате SRT."""
+    with path.open("w", encoding="utf-8") as file:
+        for index, segment in enumerate(segments, start=1):
+            file.write(f"{index}\n")
+            file.write(
+                f"{_fmt_srt_time(float(segment['start']))} --> "
+                f"{_fmt_srt_time(float(segment['end']))}\n"
+            )
+            file.write(str(segment["text"]).strip() + "\n\n")
+
+
+def _write_jsonl(
+    segments: list[dict[str, object]], info: dict[str, object], path: Path
+) -> None:
+    """Записывает метаданные и сегменты в формате JSONL."""
+    with path.open("w", encoding="utf-8") as file:
+        header = {"type": "metadata", **info}
+        file.write(json.dumps(header, ensure_ascii=False) + "\n")
+        for segment in segments:
+            file.write(
+                json.dumps({"type": "segment", **segment}, ensure_ascii=False) + "\n"
+            )
 
 
 def _probe_audio_stream(source: Path, logger: logging.Logger) -> dict[str, int | str | None] | None:
@@ -510,18 +547,33 @@ def transcribe_audio(
     start_time = time.perf_counter()
 
     try:
-        segments, info = model.transcribe(
+        segments_iter, info = model.transcribe(
             str(job.audio_path),
             beam_size=config.beam_size,
             vad_filter=config.vad_filter,
             vad_parameters={"min_silence_duration_ms": config.vad_min_silence_ms},
         )
 
-        with output_path.open("w", encoding="utf-8") as target:
-            for segment in segments:
+        segments_data: list[dict[str, object]] = []
+        with output_path.open("w", encoding="utf-8") as target_txt:
+            for segment in segments_iter:
                 text = segment.text.strip()
-                if text:
-                    target.write(text + "\n")
+                if not text:
+                    continue
+                target_txt.write(text + "\n")
+                segments_data.append(
+                    {"start": float(segment.start), "end": float(segment.end), "text": text}
+                )
+
+        metadata = {
+            "language": info.language,
+            "language_probability": info.language_probability,
+            "duration": info.duration,
+            "source_audio": job.audio_path.name,
+        }
+
+        _write_srt(segments_data, output_path.with_suffix(".srt"))
+        _write_jsonl(segments_data, metadata, output_path.with_suffix(".jsonl"))
 
         elapsed = time.perf_counter() - start_time
         logger.info(
