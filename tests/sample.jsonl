@@ -1,0 +1,5 @@
+{"type":"metadata","duration":10.0,"language":"ru"}
+{"type":"segment","start":0.0,"end":1.0,"text":"Всем привет, всем привет!"}
+{"type":"segment","start":1.1,"end":2.0,"text":"Слышно-видно?"}
+{"type":"segment","start":2.5,"end":3.1,"text":"Ну, начинаем."}
+{"type":"segment","start":3.2,"end":5.0,"text":"Сегодня говорим про GPT-2 и BERT."}

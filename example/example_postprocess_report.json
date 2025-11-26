@@ -1,0 +1,16 @@
+{
+  "source": "jsonl",
+  "no_timings": false,
+  "paragraphs": 372,
+  "avg_par_len": 327.41129032258067,
+  "config": {
+    "min_chars": 48,
+    "merge_gap_ms": 900,
+    "max_par_len": 1200,
+    "strict_dedup": true,
+    "fuzzy_dedup": true,
+    "write_clean_txt": false,
+    "write_report": true
+  }
+}
+
